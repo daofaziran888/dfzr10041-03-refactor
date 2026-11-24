@@ -11,6 +11,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from app.core.evidence import (
+    EvidenceVersion, IngestEvidenceLedger, facts_from_entries,
+    metric_from_evidence, report_from_evidence,
+)
 from app.core.models import (
     BatchCheckpoint, EventRecord, EventTypeDef, IngestJob, IngestMetric,
     LogEntry, LogFormat, LogSourceConfig, ParseResultStatus, ParseRule,
@@ -135,6 +139,8 @@ class IngestPipeline:
         self._checkpoint_store: dict[str, BatchCheckpoint] = {}
         self._event_store: dict[str, list[EventRecord]] = {}
         self._fingerprint_seen: set[str] = set()
+        # 采集计量证据：指标与报告共用的唯一计数事实。
+        self.evidence = IngestEvidenceLedger()
 
     # ---------- 数据流 1: log_source → parser_rule → ingest_job → event_store ----------
 
@@ -331,16 +337,45 @@ class IngestPipeline:
 
     def compute_ingest_metrics(self, job: IngestJob, elapsed_ms: float,
                                 total_lines: int) -> IngestMetric:
-        """从采集作业运行状态计算采集指标。
+        """从采集作业运行状态计算采集指标（旧入口，签名与返回值不变）。
 
         采集速率 = 处理行数 / 耗时(s)
         错误率 = 跳过行数 / 总行数
-        积压行数 = 总行数 - 处理行数
+        积压行数 = 总行数 - 处理行数 - 跳过行数
+
+        计数的解释只在这里做一次：先把本批处理/跳过计数登记到采集计量证据，
+        再由证据版本算出错误率和积压（速率仍按作业耗时单独计算）。空输入时
+        保持原值（速率/错误率 0，积压取 max(…, 0)）。
         """
+        base = self.evidence.ensure(job.source_id, job.batch_id, job.period)
+        if self.evidence.can_represent(
+            evidence_id=base.evidence_id,
+            processed=job.processed_lines,
+            skipped=job.skipped_lines,
+        ):
+            evidence = self.evidence.bind_counters(
+                evidence_id=base.evidence_id,
+                processed=job.processed_lines,
+                skipped=job.skipped_lines,
+                note="采集指标统计提交",
+            )
+        else:
+            # 作业计数与已登记的逐行事实不是同一批：单独成版，不篡改证据。
+            evidence = self.evidence.counter_snapshot(
+                base_evidence_id=base.evidence_id,
+                counters={
+                    "processed": job.processed_lines,
+                    "skipped": job.skipped_lines,
+                    "parse_attempted": 0,
+                    "parse_ok": 0,
+                    "failure_lines": 0,
+                },
+                note=f"采集指标直接传参 {job.job_id}",
+            )
         elapsed_s = max(elapsed_ms / 1000.0, 0.001)
-        rate = job.processed_lines / elapsed_s
-        error_rate = job.skipped_lines / total_lines if total_lines > 0 else 0.0
-        backlog = total_lines - job.processed_lines - job.skipped_lines
+        rate = evidence.processed / elapsed_s
+        error_rate = evidence.skipped / total_lines if total_lines > 0 else 0.0
+        backlog = total_lines - evidence.processed - evidence.skipped
         return IngestMetric(
             metric_id=f"INGE-{job.job_id}-{int(time.time())}",
             source_id=job.source_id,
@@ -348,6 +383,15 @@ class IngestPipeline:
             process_delay_ms=round(elapsed_ms, 2),
             error_rate=round(error_rate, 4),
             backlog_lines=max(backlog, 0),
+            evidence_id=evidence.evidence_id,
+            evidence_version=evidence.version,
+            period=job.period,
+            batch_id=job.batch_id,
+            total_lines=total_lines,
+            processed_lines=evidence.processed,
+            skipped_lines=evidence.skipped,
+            parse_attempted=evidence.parse_attempted,
+            parse_ok=evidence.parse_ok,
         )
 
     def generate_quality_report(self, metric: IngestMetric,
@@ -355,24 +399,113 @@ class IngestPipeline:
                                  fields_coverage: float,
                                  processed: int = 0,
                                  skipped: int = 0) -> QualityReport:
-        """从采集指标生成质量报告——对应 quality_report 模块。
+        """从采集指标生成质量报告（旧入口，签名与返回值不变）。
 
         完整率 = 处理行数 / (处理+跳过)
         解析成功率 = 成功解析行数 / 总处理行数
         字段覆盖率 = 已填充字段数 / 期望字段总数
+
+        旧入口的直接传参仍按原分母（processed/skipped、parse_total）计算：
+        本函数把这两个分母作为“应有总数”登记到指标绑定的同一份证据，
+        再整份读回该证据版本产出报告。指标端先提交的计数不会因此翻倍，
+        报告也没有另一套独立的分母；四项传参全为 0 时与原实现一样返回
+        0 比例，且不改动指标已登记的证据。
         """
-        total = processed + skipped
-        completeness = processed / total if total > 0 else 0.0
-        parse_rate = parse_ok / parse_total if parse_total > 0 else 0.0
-        return QualityReport(
-            report_id=f"QUAL-{metric.metric_id}",
+        if self.evidence.exists(metric.evidence_id):
+            evidence_id = metric.evidence_id
+        else:
+            evidence_id = self.evidence.ensure(
+                metric.source_id, metric.batch_id, metric.period).evidence_id
+        if not (processed or skipped or parse_total or parse_ok):
+            return QualityReport(
+                report_id=f"QUAL-{metric.metric_id}",
+                source_id=metric.source_id,
+                completeness_rate=0.0,
+                parse_success_rate=0.0,
+                field_coverage_rate=round(fields_coverage, 4),
+                time_delay_seconds=metric.process_delay_ms / 1000.0,
+                eval_period="hourly",
+                state="已生成",
+            )
+        if self.evidence.can_represent(
+            evidence_id=evidence_id,
+            processed=processed,
+            skipped=skipped,
+            parse_attempted=parse_total,
+            parse_ok=parse_ok,
+        ):
+            self.evidence.bind_counters(
+                evidence_id=evidence_id,
+                processed=processed,
+                skipped=skipped,
+                parse_attempted=parse_total,
+                parse_ok=parse_ok,
+                note="质量报告统计提交",
+            )
+        else:
+            # 直接传参与逐行事实冲突：按原分母单独成版，不篡改采集证据。
+            evidence_id = self.evidence.counter_snapshot(
+                base_evidence_id=evidence_id,
+                counters={
+                    "processed": processed,
+                    "skipped": skipped,
+                    "parse_attempted": parse_total,
+                    "parse_ok": parse_ok,
+                    "failure_lines": max(parse_total - parse_ok, 0),
+                },
+                note=f"直接传参统计 {metric.metric_id}",
+            ).evidence_id
+        version = self.evidence.current(evidence_id)
+        return report_from_evidence(
+            evidence_id=evidence_id,
+            version=version,
             source_id=metric.source_id,
-            completeness_rate=round(completeness, 4),
-            parse_success_rate=round(parse_rate, 4),
-            field_coverage_rate=round(fields_coverage, 4),
-            time_delay_seconds=metric.process_delay_ms / 1000.0,
-            eval_period="hourly",
-            state="已生成",
+            report_id=f"QUAL-{metric.metric_id}",
+            fields_coverage=fields_coverage,
+            process_delay_ms=metric.process_delay_ms,
+            period=metric.period or "hourly",
+            batch_id=metric.batch_id,
+            metric_id=metric.metric_id,
+        )
+
+    # ---------- 数据流 8（新计量路径）：逐行证据 → 指标 + 报告 ----------
+
+    def record_ingest_evidence(self, source_id: str, entries: list[LogEntry],
+                                *, batch_id: str = "", period: str = "") -> EvidenceVersion:
+        """把一次采集的逐行结果登记为采集计量证据。"""
+        return self.evidence.record_lines(
+            source_id=source_id, period=period, batch_id=batch_id,
+            facts=facts_from_entries(source_id, entries),
+        )
+
+    def compute_metrics_from_evidence(self, job: IngestJob, elapsed_ms: float,
+                                       evidence_id: str) -> IngestMetric:
+        """新计量路径：按证据版本算采集指标（速率/错误率/积压各自计算）。"""
+        elapsed_s = max(elapsed_ms / 1000.0, 0.001)
+        version = self.evidence.current(evidence_id)
+        return metric_from_evidence(
+            evidence_id=evidence_id, version=version,
+            source_id=job.source_id,
+            metric_id=f"INGE-{job.job_id}-{version.version}",
+            ingest_rate=job.processed_lines / elapsed_s,
+            process_delay_ms=elapsed_ms,
+            total_lines=version.total,
+            period=job.period, batch_id=job.batch_id,
+        )
+
+    def report_from_evidence(self, metric: IngestMetric, evidence_id: str,
+                              fields_coverage: float,
+                              version: int | None = None) -> QualityReport:
+        """新计量路径：报告的两项比例整份取自同一证据版本。"""
+        evidence = (self.evidence.version(evidence_id, version) if version
+                    else self.evidence.current(evidence_id))
+        return report_from_evidence(
+            evidence_id=evidence_id, version=evidence, source_id=metric.source_id,
+            report_id=f"QUAL-{metric.metric_id}",
+            fields_coverage=fields_coverage,
+            process_delay_ms=metric.process_delay_ms,
+            period=metric.period or "hourly", batch_id=metric.batch_id,
+            metric_id=metric.metric_id,
         )
 
     # ---------- 数据流 5: event_type → anomaly_rule → forward_rule ----------

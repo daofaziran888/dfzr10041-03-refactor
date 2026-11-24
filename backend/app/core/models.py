@@ -294,11 +294,17 @@ class IngestJob:
     processed_lines: int = 0
     skipped_lines: int = 0
     state: str = "待执行"
+    batch_id: str = ""
+    period: str = ""
 
 
 @dataclass
 class IngestMetric:
-    """采集指标——对应 ingest_metric 模块。"""
+    """采集指标——对应 ingest_metric 模块。
+
+    原有字段（速率、错误率、积压）仍各自独立计算；evidence_* 系列字段只是
+    把本次处理/跳过计数绑定到采集计量证据的某个版本，不改变指标自身的口径。
+    """
     metric_id: str
     source_id: str
     ingest_rate: float = 0.0
@@ -306,11 +312,24 @@ class IngestMetric:
     error_rate: float = 0.0
     backlog_lines: int = 0
     sample_time: datetime = field(default_factory=datetime.now)
+    evidence_id: str | None = None
+    evidence_version: int | None = None
+    period: str = ""
+    batch_id: str = ""
+    total_lines: int = 0
+    processed_lines: int = 0
+    skipped_lines: int = 0
+    parse_attempted: int = 0
+    parse_ok: int = 0
 
 
 @dataclass
 class QualityReport:
-    """质量报告——对应 quality_report 模块。"""
+    """质量报告——对应 quality_report 模块。
+
+    完整率、解析成功率等各项比例必须全部取自同一份计量证据版本；
+    落库时把所用计数一并冻结，用于后续复算和同源校验。
+    """
     report_id: str
     source_id: str
     completeness_rate: float = 0.0
@@ -319,6 +338,16 @@ class QualityReport:
     time_delay_seconds: float = 0.0
     eval_period: str = "daily"
     state: str = "待生成"
+    evidence_id: str | None = None
+    evidence_version: int | None = None
+    period: str = ""
+    batch_id: str = ""
+    metric_id: str = ""
+    processed_lines: int = 0
+    skipped_lines: int = 0
+    parse_attempted: int = 0
+    parse_ok: int = 0
+    failure_lines: int = 0
 
 
 @dataclass
